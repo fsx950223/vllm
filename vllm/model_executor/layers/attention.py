@@ -3,10 +3,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
-                                         LowerTriangularMaskWithTensorBias)
-
+# from xformers import ops as xops
+# from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
+#                                          LowerTriangularMaskWithTensorBias)
+from flash_attn.flash_attn_interface import _flash_attn_forward
 from vllm import attention_ops
 from vllm import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
@@ -68,16 +68,17 @@ class PagedAttention(nn.Module):
         input_metadata: InputMetadata,
         dtype: torch.dtype,
     ) -> None:
-        del dtype  # Unused.
-        if input_metadata.attn_bias is not None:
-            # Already set by a previous layer.
-            return
-        prompt_lens = [input_metadata.max_prompt_len
-                       ] * input_metadata.num_prompts
-        attn_bias = BlockDiagonalCausalMask.from_seqlens(prompt_lens)
-        if self.sliding_window is not None:
-            attn_bias = attn_bias.make_local_attention(self.sliding_window)
-        input_metadata.attn_bias = attn_bias
+        return
+        # del dtype  # Unused.
+        # if input_metadata.attn_bias is not None:
+        #     # Already set by a previous layer.
+        #     return
+        # prompt_lens = [input_metadata.max_prompt_len
+        #                ] * input_metadata.num_prompts
+        # attn_bias = BlockDiagonalCausalMask.from_seqlens(prompt_lens)
+        # if self.sliding_window is not None:
+        #     attn_bias = attn_bias.make_local_attention(self.sliding_window)
+        # input_metadata.attn_bias = attn_bias
 
     def multi_query_kv_attention(
         self,
@@ -104,16 +105,19 @@ class PagedAttention(nn.Module):
                                             dim=1)
 
         # TODO(woosuk): The unsqueeze op may incur some CPU overhead. Optimize.
-        out = xops.memory_efficient_attention_forward(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            attn_bias=input_metadata.attn_bias,
-            p=0.0,
-            scale=self.scale,
-        )
-        # TODO(woosuk): Unnecessary copy. Optimize.
-        output.copy_(out.squeeze(0))
+        # out = xops.memory_efficient_attention_forward(
+        #     query.unsqueeze(0),
+        #     key.unsqueeze(0),
+        #     value.unsqueeze(0),
+        #     attn_bias=input_metadata.attn_bias,
+        #     p=0.0,
+        #     scale=self.scale,
+        # )
+        softmax_scale = self.head_size ** (-0.5)
+        seq_len = input_metadata.prompt_lens[0]
+        seq_lens = torch.tensor(input_metadata.prompt_lens, dtype=torch.int32)
+        out, _, _, = _flash_attn_forward(query, key, value, torch.empty_like(query), seq_lens, seq_lens, seq_len, seq_len, 0.0, softmax_scale, True, False)
+        output.copy_(out)
         return output
 
     def get_alibi_slopes(self) -> Optional[torch.Tensor]:
@@ -449,7 +453,7 @@ class PagedAttentionWithALiBi(PagedAttention):
                                             dim=1)
         batch_size = input_metadata.num_prompts
         seq_len = input_metadata.max_prompt_len
-
+        
         out = xops.memory_efficient_attention_forward(
             query.view(batch_size, seq_len, self.num_heads, self.head_size),
             key.view(batch_size, seq_len, self.num_heads, self.head_size),

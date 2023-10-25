@@ -23,7 +23,11 @@
 
 #include <algorithm>
 
-#define WARP_SIZE 32
+#ifndef USE_ROCM
+  #define DEFAULT_NUM_THREADS 128
+#else
+  #define DEFAULT_NUM_THREADS 256
+#endif
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
@@ -39,7 +43,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
 
   // Compute the sum per warp.
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask >>= 1) {
     sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
@@ -58,7 +62,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
 
   // Parallel reduction inside the warp.
 #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask >>= 1) {
     sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
@@ -114,8 +118,6 @@ __device__ void paged_attention_kernel(
   const int num_tokens = end_token_idx - start_token_idx;
 
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
-  constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS
-  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
   constexpr int NUM_TOKENS_PER_THREAD_GROUP = DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int thread_idx = threadIdx.x;
@@ -149,11 +151,11 @@ __device__ void paged_attention_kernel(
   // th vectors of the query, and so on.
   // NOTE(woosuk): Because q is split from a qkv tensor, it may not be contiguous.
   const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-  __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
+  Q_vec q_vecs[NUM_VECS_PER_THREAD];
 #pragma unroll
-  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD; i += NUM_THREAD_GROUPS) {
+  for (int i = 0; i < NUM_VECS_PER_THREAD; i++) {
     const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
-    q_vecs[thread_group_offset][i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
+    q_vecs[i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
   }
   __syncthreads(); // TODO(naed90): possible speedup if this is replaced with a memory wall right before we use q_vecs
 
@@ -200,7 +202,7 @@ __device__ void paged_attention_kernel(
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
-      float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset], k_vecs);
+      float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs, k_vecs);
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;
 
@@ -231,7 +233,7 @@ __device__ void paged_attention_kernel(
   // Get the max qk value for the sequence.
   qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask >>= 1) {
     qk_max = fmaxf(qk_max, VLLM_SHFL_XOR_SYNC(qk_max, mask));
   }
   // Broadcast the max qk value to all threads.
@@ -319,7 +321,7 @@ __device__ void paged_attention_kernel(
   for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
     float acc = accs[i];
 #pragma unroll
-    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
+    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask >>= 1) {
       acc += VLLM_SHFL_XOR_SYNC(acc, mask);
     }
     accs[i] = acc;
@@ -332,8 +334,8 @@ __device__ void paged_attention_kernel(
   // Perform reduction across warps.
   float* out_smem = reinterpret_cast<float*>(shared_mem);
 #pragma unroll
-  for (int i = NUM_WARPS; i > 1; i /= 2) {
-    int mid = i / 2;
+  for (int i = NUM_WARPS; i > 1; i >>= 1) {
+    int mid = i >> 1;
     // Upper warps write to shared memory.
     if (warp_idx >= mid && warp_idx < i) {
       float* dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
@@ -485,7 +487,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   // Get the global max logit.
   // Reduce within the warp.
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask >>= 1) {
     max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
   }
   if (lane == 0) {
@@ -495,7 +497,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   // Reduce across warps.
   max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask >>= 1) {
     max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
   }
   // Broadcast the max value to all threads.
@@ -533,9 +535,9 @@ __global__ void paged_attention_v2_reduce_kernel(
 } // namespace vllm
 
 #define LAUNCH_PAGED_ATTENTION_V1(HEAD_SIZE)                                                  \
-  cudaFuncSetAttribute(                                                                       \
+  hipFuncSetAttribute(                                                                       \
     (void*)vllm::paged_attention_v1_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>,            \
-    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);                            \
+    hipFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);                            \
   vllm::paged_attention_v1_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>                      \
   <<<grid, block, shared_mem_size, stream>>>(                                                 \
     out_ptr,                                                                                  \
@@ -556,7 +558,7 @@ __global__ void paged_attention_v2_reduce_kernel(
 template<
   typename T,
   int BLOCK_SIZE,
-  int NUM_THREADS = 128>
+  int NUM_THREADS = DEFAULT_NUM_THREADS>
 void paged_attention_v1_launcher(
   torch::Tensor& out,
   torch::Tensor& query,
@@ -715,7 +717,7 @@ void paged_attention_v1(
 template<
   typename T,
   int BLOCK_SIZE,
-  int NUM_THREADS = 128,
+  int NUM_THREADS = DEFAULT_NUM_THREADS,
   int PARTITION_SIZE = 512>
 void paged_attention_v2_launcher(
   torch::Tensor& out,

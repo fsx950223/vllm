@@ -17,3 +17,10 @@
 #else
   #define VLLM_SHFL_SYNC(var, src_lane) __shfl(var, src_lane)
 #endif
+
+
+#ifndef USE_ROCM
+  #define WARP_SIZE 32
+#else
+  #define WARP_SIZE 64
+#endif

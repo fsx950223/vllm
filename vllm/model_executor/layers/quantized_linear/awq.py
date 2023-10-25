@@ -3,7 +3,10 @@ from typing import Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import quantization_ops
+try:
+    from vllm import quantization_ops
+except:
+    pass
 from vllm.model_executor.parallel_utils.layers import (ColumnParallelLinear,
                                                        RowParallelLinear)
 
